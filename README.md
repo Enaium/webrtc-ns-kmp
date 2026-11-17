@@ -100,6 +100,12 @@ fun noiseSuppressorVersion(): String
 
 The suppressor's output is delayed by its overlap-add synthesis: 6 ms at 16 kHz, plus the analysis/synthesis filter-bank delay at 32/48 kHz. A streaming consumer can leave this constant delay in place or compensate it when aligning the output against another signal.
 
+### Quality and sample rate
+
+16 kHz is the rate WebRTC's noise suppressor is built around, and it gives the best result. At 32/48 kHz the suppressor splits each 10 ms frame into 2/3 bands of 16 kHz with a filter bank before processing it; that filter bank in the standalone extraction is not perfect reconstruction, so part of the noise reduction is traded for broadband error. Measured on the fixture recording in [`webrtc-ns/tests`](webrtc-ns/tests) at 6 dB: the SNR improves by 3.0 dB at 16 kHz, but only by 0.4 dB at 48 kHz.
+
+For voice use 16 kHz. 48 kHz is supported and no longer adds the static caused by advancing the filter bank twice per frame (the binding drives `NoiseSuppressor` directly so each filter bank sees exactly one frame per call), but the band filter bank still limits how much of the improvement survives.
+
 ## Examples
 
 ### [`examples/basic`](examples/basic/) — Android Compose demo

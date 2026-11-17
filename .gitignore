@@ -43,3 +43,5 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+### Gradle daemon JVM criteria (generated) ###
+gradle/gradle-daemon-jvm.properties

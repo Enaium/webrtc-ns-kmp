@@ -9,25 +9,26 @@
 #include "webrtc_ns_c.h"
 
 #include <cstddef>
-#include <vector>
 
-#include "api/noise_suppression.h"
+#include "audio_processing/audio_buffer.h"
+#include "audio_processing/ns/noise_suppressor.h"
+#include "audio_processing/ns/ns_config.h"
 
 namespace {
 
 constexpr int kMaxChannels = WEBRTC_NS_MAX_CHANNELS;
 
-webrtc::NoiseSuppression::Level ToLevel(int level) {
+webrtc::NsConfig::SuppressionLevel ToLevel(int level) {
   switch (level) {
     case WEBRTC_NS_LEVEL_6_DB:
-      return webrtc::NoiseSuppression::Level::k6dB;
+      return webrtc::NsConfig::SuppressionLevel::k6dB;
     case WEBRTC_NS_LEVEL_18_DB:
-      return webrtc::NoiseSuppression::Level::k18dB;
+      return webrtc::NsConfig::SuppressionLevel::k18dB;
     case WEBRTC_NS_LEVEL_21_DB:
-      return webrtc::NoiseSuppression::Level::k21dB;
+      return webrtc::NsConfig::SuppressionLevel::k21dB;
     case WEBRTC_NS_LEVEL_12_DB:
     default:
-      return webrtc::NoiseSuppression::Level::k12dB;
+      return webrtc::NsConfig::SuppressionLevel::k12dB;
   }
 }
 
@@ -38,52 +39,76 @@ bool IsSupportedSampleRate(int sample_rate_hz) {
 
 }  // namespace
 
+// This wrapper drives NoiseSuppressor and AudioBuffer directly instead of the
+// `webrtc::NoiseSuppression` convenience class the extraction ships. That class
+// calls AudioBuffer::SplitIntoFrequencyBands() once in Analyze() and once in
+// Process(), but the analysis filter bank has state: at 32/48 kHz every frame
+// would advance it twice while the signal is only merged once, which decorrelates
+// the bands the suppressor analyses from the ones it processes and leaves
+// broadband artefacts ("static") in the output. Two AudioBuffers - one for the
+// analysed frame, one for the processed frame - keep each filter bank advancing
+// once per 10 ms frame, so an unmodified frame analyses and processes the same
+// bands.
 struct webrtc_ns_suppressor_t {
   webrtc_ns_suppressor_t(int sample_rate_hz,
                          int num_channels,
-                         webrtc::NoiseSuppression::Level level)
-      : impl(sample_rate_hz,
-             static_cast<size_t>(num_channels),
-             webrtc::NoiseSuppression::Config{level}),
+                         webrtc::NsConfig::SuppressionLevel level)
+      : analysis_audio_(static_cast<size_t>(sample_rate_hz),
+                        static_cast<size_t>(num_channels),
+                        static_cast<size_t>(sample_rate_hz),
+                        static_cast<size_t>(num_channels),
+                        static_cast<size_t>(sample_rate_hz),
+                        static_cast<size_t>(num_channels)),
+        process_audio_(static_cast<size_t>(sample_rate_hz),
+                       static_cast<size_t>(num_channels),
+                       static_cast<size_t>(sample_rate_hz),
+                       static_cast<size_t>(num_channels),
+                       static_cast<size_t>(sample_rate_hz),
+                       static_cast<size_t>(num_channels)),
+        impl_(MakeConfig(level),
+              static_cast<size_t>(sample_rate_hz),
+              static_cast<size_t>(num_channels)),
         sample_rate_hz(sample_rate_hz),
         num_channels(num_channels),
-        num_frames_per_channel(sample_rate_hz / 100),
-        // Only multi-channel frames are deinterleaved; the mono path hands the
-        // caller's buffer to the library directly.
-        planar(static_cast<size_t>(num_channels),
-               std::vector<float>(static_cast<size_t>(num_frames_per_channel))),
-        pointers(static_cast<size_t>(num_channels)) {
-    for (int ch = 0; ch < num_channels; ++ch) {
-      pointers[static_cast<size_t>(ch)] = planar[static_cast<size_t>(ch)].data();
-    }
+        num_frames_per_channel(sample_rate_hz / 100) {}
+
+  static webrtc::NsConfig MakeConfig(
+      webrtc::NsConfig::SuppressionLevel level) {
+    webrtc::NsConfig config;
+    config.target_level = level;
+    return config;
   }
 
-  /** Interleaved -> per-channel scratch. */
-  void Deinterleave(const float* interleaved) {
+  /** Interleaved -> the buffer's per-channel full-band storage. */
+  void CopyIn(webrtc::AudioBuffer& audio, const float* interleaved) const {
+    float* const* channels = audio.channels();
     for (int frame = 0; frame < num_frames_per_channel; ++frame) {
       const float* source = interleaved + frame * num_channels;
       for (int ch = 0; ch < num_channels; ++ch) {
-        planar[static_cast<size_t>(ch)][static_cast<size_t>(frame)] = source[ch];
+        channels[ch][frame] = source[ch];
       }
     }
   }
 
-  /** Per-channel scratch -> interleaved. */
-  void Interleave(float* interleaved) const {
+  /** The buffer's per-channel full-band storage -> interleaved. */
+  void CopyOut(const webrtc::AudioBuffer& audio, float* interleaved) const {
+    const float* const* channels = audio.channels_const();
     for (int frame = 0; frame < num_frames_per_channel; ++frame) {
       float* destination = interleaved + frame * num_channels;
       for (int ch = 0; ch < num_channels; ++ch) {
-        destination[ch] = planar[static_cast<size_t>(ch)][static_cast<size_t>(frame)];
+        destination[ch] = channels[ch][frame];
       }
     }
   }
 
-  webrtc::NoiseSuppression impl;
+  // The two banks of 32/48 kHz analysis filters. Both see exactly one frame per
+  // call, so neither is advanced twice for the same frame.
+  webrtc::AudioBuffer analysis_audio_;
+  webrtc::AudioBuffer process_audio_;
+  webrtc::NoiseSuppressor impl_;
   const int sample_rate_hz;
   const int num_channels;
   const int num_frames_per_channel;
-  std::vector<std::vector<float>> planar;
-  std::vector<float*> pointers;
   bool capture_output_used = true;
 };
 
@@ -113,13 +138,9 @@ bool webrtc_ns_suppressor_analyze(webrtc_ns_suppressor_t* suppressor,
       num_frames != suppressor->num_frames_per_channel) {
     return false;
   }
-  if (suppressor->num_channels == 1) {
-    const float* channels[1] = {interleaved};
-    suppressor->impl.Analyze(channels);
-    return true;
-  }
-  suppressor->Deinterleave(interleaved);
-  suppressor->impl.Analyze(suppressor->pointers.data());
+  suppressor->CopyIn(suppressor->analysis_audio_, interleaved);
+  suppressor->analysis_audio_.SplitIntoFrequencyBands();
+  suppressor->impl_.Analyze(suppressor->analysis_audio_);
   return true;
 }
 
@@ -130,18 +151,19 @@ bool webrtc_ns_suppressor_process(webrtc_ns_suppressor_t* suppressor,
       num_frames != suppressor->num_frames_per_channel) {
     return false;
   }
-  if (!suppressor->capture_output_used) {
+  suppressor->CopyIn(suppressor->process_audio_, interleaved);
+  suppressor->process_audio_.SplitIntoFrequencyBands();
+  const bool output_used = suppressor->capture_output_used;
+  // Process updates the suppressor's state before it decides whether the
+  // output is wanted, so it is called even while muted; only the synthesis and
+  // the copy back are skipped then.
+  suppressor->impl_.Process(&suppressor->process_audio_);
+  if (!output_used) {
     // Bypassed: the caller's frame already holds its own output.
     return true;
   }
-  if (suppressor->num_channels == 1) {
-    float* channels[1] = {interleaved};
-    suppressor->impl.Process(channels);
-    return true;
-  }
-  suppressor->Deinterleave(interleaved);
-  suppressor->impl.Process(suppressor->pointers.data());
-  suppressor->Interleave(interleaved);
+  suppressor->process_audio_.MergeFrequencyBands();
+  suppressor->CopyOut(suppressor->process_audio_, interleaved);
   return true;
 }
 
@@ -151,7 +173,7 @@ void webrtc_ns_suppressor_set_capture_output_usage(
     return;
   }
   suppressor->capture_output_used = capture_output_used;
-  suppressor->impl.SetCaptureOutputUsage(capture_output_used);
+  suppressor->impl_.SetCaptureOutputUsage(capture_output_used);
 }
 
 int webrtc_ns_suppressor_sample_rate_hz(
