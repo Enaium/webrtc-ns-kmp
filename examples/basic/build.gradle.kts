@@ -45,7 +45,7 @@ kotlin {
 
 dependencies {
     // Consume the artifact published to the local Maven repository
-    implementation("cn.enaium.webrtc.ns:webrtc-ns-kmp:1.0.0")
+    implementation("cn.enaium.webrtc.ns:webrtc-ns-kmp:1.0.0-rolling.pRJneQThJ")
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

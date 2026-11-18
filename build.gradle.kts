@@ -97,7 +97,7 @@ val androidNdkSysrootPath: String? = androidNdkSysroot()?.absolutePath
 
 allprojects {
     group = "cn.enaium.webrtc.ns"
-    version = "1.0.0"
+    version = "1.0.0-rolling.pRJneQThJ"
 
     // CMake-driven modules take this instead of looking `cmake` up on PATH.
     extra["cmakeExecutable"] = cmakeExecutable
