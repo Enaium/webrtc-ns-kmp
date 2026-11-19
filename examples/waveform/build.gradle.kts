@@ -179,9 +179,9 @@ kotlin {
                 // The Emscripten runtimes (SDL3, Dear ImGui, Web Audio glue and
                 // the NS module) are installed as npm packages and copied next
                 // to the page by copyWasmAssets.
-                implementation(npm("@enaium/sdl-kmp", libs.versions.sdl.kmp.npm.get()))
-                implementation(npm("@enaium/imgui-kmp", libs.versions.imgui.kmp.npm.get()))
-                implementation(npm("@enaium/audio-io-kmp", libs.versions.audio.io.kmp.npm.get()))
+                implementation(npm("@enaium/sdl-kmp", libs.versions.sdl.kmp.get()))
+                implementation(npm("@enaium/imgui-kmp", libs.versions.imgui.kmp.get()))
+                implementation(npm("@enaium/audio-io-kmp", libs.versions.audio.io.kmp.get()))
             }
         }
     }
