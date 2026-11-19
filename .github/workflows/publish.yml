@@ -14,8 +14,9 @@ name: Publish
 #                    :ns androidNative targets (NDK cross-compiled static libs)
 #                    :jni-jvm-linux-x86_64, :jni-jvm-linux-aarch64
 #   windows-latest -> :jni-jvm-windows-x86_64 (via MinGW)
-#   ubuntu-latest  -> :ns wasmJs klib + the @enaium/webrtc-ns-kmp npm package
-#                    (Emscripten-compiled NS module; wasmJs has no cinterop)
+#   ubuntu-latest  -> :ns wasmJs klib (Emscripten-compiled NS module;
+#                    wasmJs has no cinterop). The npm package is published
+#                    from a workstation, not by this workflow.
 #
 # Trigger: run manually via the Actions tab. Version is fixed at
 # 1.0.0-rolling.pRJneQThJ (build.gradle.kts).
@@ -122,8 +123,8 @@ jobs:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
 
-  publish-wasm-npm:
-    name: Publish wasmJs klib + npm package
+  publish-wasm:
+    name: Publish wasmJs klib
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -164,14 +165,6 @@ jobs:
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
-
-      - name: Publish the @enaium/webrtc-ns-kmp npm package
-        run: |
-          install -d "$HOME/.gradle"
-          printf 'npm.publish.key=%s\n' "$NPM_PUBLISH_KEY" >> "$HOME/.gradle/gradle.properties"
-          ./gradlew --no-daemon --stacktrace -Pwasm.emsdk="$HOME/emsdk" :ns:publishWasmNpm
-        env:
-          NPM_PUBLISH_KEY: ${{ secrets.NPM_PUBLISH_KEY }}
 
   publish-windows:
     name: Publish Windows JNI
