@@ -298,3 +298,11 @@ jobs:
           -Pwasm.emsdk="$HOME/emsdk"
           :ns:compileKotlinWasmJs
           :ns:testWasmNs
+
+      - name: Build the waveform browser distribution
+        # Compiles the waveform's wasmJs target, links the NS Emscripten module
+        # and copies the SDL/imgui/Web Audio runtimes next to the page.
+        run: >
+          ./gradlew --no-daemon --stacktrace
+          -Pwasm.emsdk="$HOME/emsdk"
+          :examples:waveform:wasmJsBrowserDistribution

@@ -16,6 +16,27 @@ dependencyResolutionManagement {
         mavenLocal()
         google()
         mavenCentral()
+        // The Kotlin JS plugin resolves its Node.js distribution from here.
+        // PREFER_SETTINGS keeps project-level repositories out of the way, so
+        // the distribution has to be declared next to the Maven ones.
+        ivy("https://nodejs.org/dist") {
+            name = "NodeDistributions"
+            patternLayout {
+                artifact("v[revision]/[artifact]-v[revision]-[classifier].[ext]")
+            }
+            metadataSources { artifact() }
+            content { includeModule("org.nodejs", "node") }
+        }
+        // Kotlin/Wasm links its executables with binaryen, which the plugin
+        // fetches from the upstream GitHub release.
+        ivy("https://github.com/WebAssembly/binaryen/releases/download") {
+            name = "BinaryenDistributions"
+            patternLayout {
+                artifact("version_[revision]/binaryen-version_[revision]-[classifier].[ext]")
+            }
+            metadataSources { artifact() }
+            content { includeModule("com.github.webassembly", "binaryen") }
+        }
     }
 }
 

@@ -115,7 +115,11 @@ kotlin {
     // Kotlin/Wasm has no cinterop, so the wasmJs actuals drive a standalone
     // Emscripten module through a JS glue layer; see the wasm section below
     // and ns/wasm/.
-    wasmJs()
+    wasmJs {
+        // A JS environment is required for the npm tooling even though this is
+        // a library: the example installs the Emscripten runtime from npm.
+        browser()
+    }
 
     // ==================== Native ====================
     macosArm64()

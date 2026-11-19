@@ -137,18 +137,26 @@ It captures the microphone, suppresses each 10 ms frame and plays the result bac
 
 ### [`examples/waveform`](examples/waveform/) — live waveform viewer
 
-A Kotlin Multiplatform app (JVM desktop, macOS/Linux/Windows native executables and Android via [`examples/waveform/android`](examples/waveform/android/)) that draws the NS signals with Dear ImGui + ImPlot in an SDL3 window:
+A Kotlin Multiplatform app (JVM desktop, macOS/Linux/Windows native executables, the browser via wasmJs, and Android via [`examples/waveform/android`](examples/waveform/android/)) that draws the NS signals with Dear ImGui + ImPlot in an SDL3 window:
 
 - **Two traces** — the raw microphone capture and the noise-suppressed output, over a 100 ms–10 s sliding window
-- **SDL_GPU rendering** — the window is drawn with the imgui-kmp SDL_GPU backend (Vulkan on Android and desktop, Metal on macOS); where SDL_GPU is unavailable (headless CI runs on SDL's dummy driver) the log says so and the 2D renderer takes over
+- **SDL_GPU rendering** — the window is drawn with the imgui-kmp SDL_GPU backend (Vulkan on Android and desktop, Metal on macOS); where SDL_GPU is unavailable (headless CI runs on SDL's dummy driver, browsers without WebGPU) the log says so and the 2D renderer takes over
 - **Audible result** — the suppressed capture is played through the output device, so the attenuation can be heard and not just seen; playback is toggled from the UI
-- **NS controls** — NS on/off, suppression level and window length
+- **NS controls** — audio start/pause, NS on/off, suppression level and window length
 - **Levels** — input/output dBFS of the last second, clipping, device drops and gaps
 
 ```bash
 ./gradlew :examples:waveform:jvmRun                  # desktop JVM
 ./gradlew :examples:waveform:android:assembleDebug   # Android APK
+
+# browser: builds the NS Emscripten module, the UI bundle and copies the
+# SDL/imgui/Web Audio runtimes next to the page
+./gradlew -Pwasm.emsdk="$HOME/emsdk" :examples:waveform:wasmJsBrowserDistribution
+python3 -m http.server 8080 -d examples/waveform/build/dist/wasmJs/productionExecutable
+# open http://localhost:8080
 ```
+
+The browser page starts with audio paused (an `AudioContext` may only start after a user gesture): click **audio** in the UI to open the microphone and playback. The page must be served over `http://localhost` or HTTPS, because browsers only expose the microphone in a secure context. The page drives the UI from `requestAnimationFrame` and polls the Web Audio backend, so the Kotlin/Wasm module never blocks the browser thread.
 
 Native executables (`./examples/waveform/build/bin/<target>/<mode>Executable/waveform.kexe`) take `NS_KMP_FRAMES` to bound a headless run; the JVM entry takes `--frames N`.
 

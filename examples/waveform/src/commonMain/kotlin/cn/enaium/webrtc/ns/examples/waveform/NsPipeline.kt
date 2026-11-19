@@ -126,6 +126,15 @@ class NsPipeline(
     @Volatile
     var nsEnabled: Boolean = true
 
+    /**
+     * Whether audio is paused. The browser page starts paused because an
+     * `AudioContext` may only start after a user gesture; clicking the audio
+     * checkbox opens the devices. Desktop and native entry points start
+     * unpaused.
+     */
+    @Volatile
+    var paused: Boolean = false
+
     /** Whether the processed capture is played back. */
     @Volatile
     var playbackEnabled: Boolean = true
@@ -253,10 +262,39 @@ class NsPipeline(
         burstFloats = FloatArray(FRAME_SAMPLES * BUFFER_FRAMES)
     }
 
-    /** Starts the audio thread. */
+    /** Starts the audio thread; not available on the browser, which calls [pump]. */
     fun start() {
         if (worker != null || closed) return
         worker = AudioThread("webrtc-ns-waveform-audio") { audioLoop() }.also { it.start() }
+    }
+
+    /**
+     * One poll iteration of the audio loop, for hosts that cannot block.
+     *
+     * The browser drives this from its animation frame: `AudioInput.read`
+     * returns the frames that are buffered (0 while none are) instead of
+     * blocking, so the page loop drains the capture and refills the playback.
+     * Returns `false` when there is nothing to pump (paused, closed, or no
+     * capture device yet), `true` when a stream is open.
+     */
+    fun pump(): Boolean {
+        if (closed || paused) return false
+
+        val capture = input ?: openCapture() ?: return false
+        input = capture
+
+        // Playback is optional: without an output device the example still
+        // captures and suppresses, it just cannot be heard.
+        val playbackStream = output ?: openPlayback()?.also { output = it }
+
+        val frames = capture.read(readBuffer)
+        // A stopped or closed stream unblocks the wait with -1; that is how
+        // close() gets a blocking thread out of the read.
+        if (frames < 0) return false
+        if (frames == 0) return true
+
+        process(frames, playbackStream)
+        return true
     }
 
     /**
@@ -266,24 +304,7 @@ class NsPipeline(
      */
     private fun audioLoop() {
         while (!closed) {
-            val capture = input ?: openCapture()
-            if (capture == null) {
-                SDL.delay(RETRY_DELAY_MS)
-                continue
-            }
-            input = capture
-
-            // Playback is optional: without an output device the example still
-            // captures and suppresses, it just cannot be heard.
-            val playbackStream = output ?: openPlayback()?.also { output = it }
-
-            val frames = capture.read(readBuffer)
-            // A stopped or closed stream unblocks the wait with -1; that is how
-            // close() gets this thread out of the read.
-            if (frames < 0) return
-            if (frames == 0) continue
-
-            process(frames, playbackStream)
+            if (!pump()) SDL.delay(RETRY_DELAY_MS)
         }
     }
 

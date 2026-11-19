@@ -28,9 +28,9 @@
  *
  * Marshaling conventions (see webrtc_ns_wasm_shim.c):
  *   - the suppressor handle is an int; scalars are passed straight through;
- *   - a frame is a Float32Array: the glue allocates an Emscripten heap buffer,
- *     copies the array into it, calls the shim, and (for process) copies the
- *     processed frame back before freeing the buffer;
+ *   - a frame is a Float32Array: the glue copies it into one reusable
+ *     Emscripten heap buffer, calls the shim, and (for process) copies the
+ *     processed frame back;
  *   - the module is initialized asynchronously, so the host has to await
  *     initWebrtcNsKmp() before creating a suppressor from Kotlin.
  */
@@ -52,35 +52,37 @@ export async function initWebrtcNsKmp(options = {}) {
     const numFramesPerChannel = C('webrtc_ns_wasm_num_frames_per_channel', 'number', ['number']);
     const version = C('webrtc_ns_wasm_version', 'string', []);
 
-    /* Copies a frame into the heap and returns its byte offset. */
+    // One heap buffer serves every frame the page processes; growing it once
+    // is what keeps a 10 ms audio callback free of malloc/free traffic.
+    let framePtr = 0;
+    let frameCapacity = 0;
+
+    /* Copies a frame into the reusable heap buffer and returns its byte offset. */
     const pushFrame = (samples) => {
-        const ptr = Module._malloc(samples.length * 4);
-        if (!ptr) throw new Error('webrtc-ns: out of wasm memory');
-        Module.HEAPF32.set(samples, ptr >> 2);
-        return ptr;
+        const floats = samples.length;
+        if (floats > frameCapacity) {
+            if (framePtr) Module._free(framePtr);
+            framePtr = Module._malloc(floats * 4);
+            if (!framePtr) throw new Error('webrtc-ns: out of wasm memory');
+            frameCapacity = floats;
+        }
+        Module.HEAPF32.set(samples, framePtr >> 2);
+        return framePtr;
     };
 
     globalThis.webrtcNsKmpCreate = (rate, channels, level) => create(rate, channels, level);
     globalThis.webrtcNsKmpDestroy = (handle) => destroy(handle);
     globalThis.webrtcNsKmpAnalyze = (handle, samples, numFrames) => {
         const ptr = pushFrame(samples);
-        try {
-            return analyze(handle, ptr, numFrames);
-        } finally {
-            Module._free(ptr);
-        }
+        return analyze(handle, ptr, numFrames);
     };
     globalThis.webrtcNsKmpProcess = (handle, samples, numFrames) => {
         const ptr = pushFrame(samples);
-        try {
-            const ok = process(handle, ptr, numFrames);
-            // The heap may have grown during the call, so re-read HEAPF32
-            // after it before copying the result back.
-            samples.set(Module.HEAPF32.subarray(ptr >> 2, (ptr >> 2) + samples.length));
-            return ok;
-        } finally {
-            Module._free(ptr);
-        }
+        const ok = process(handle, ptr, numFrames);
+        // The heap may have grown during the call, so re-read HEAPF32 after it
+        // before copying the result back.
+        samples.set(Module.HEAPF32.subarray(ptr >> 2, (ptr >> 2) + samples.length));
+        return ok;
     };
     globalThis.webrtcNsKmpSetCaptureOutputUsage = (handle, used) =>
         setCaptureOutputUsage(handle, used ? 1 : 0);

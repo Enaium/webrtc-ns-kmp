@@ -23,41 +23,113 @@
 package cn.enaium.webrtc.ns.examples.waveform
 
 /**
- * Live noise suppression visualization, shared by the JVM and native entry
- * points: the 48 kHz mono microphone capture is suppressed by [NsPipeline], the
- * result is played back, and both signals are drawn with ImPlot in an SDL
- * window.
+ * Live noise suppression visualization, shared by the JVM, native and browser
+ * entry points: the 48 kHz mono microphone capture is suppressed by
+ * [NsPipeline], the result is played back, and both signals are drawn with
+ * ImPlot in an SDL window.
  *
- * The scopes are sized for the longest window the UI can show, so the slider
- * can widen it without touching the pipeline.
+ * [WaveformApp.run] is the blocking loop of the desktop and native entry
+ * points. The browser cannot block its page, so its entry point calls
+ * [WaveformApp.start] and drives [WaveformSession.step] from
+ * `requestAnimationFrame`; that mode also polls the audio backend instead of
+ * starting the audio thread.
+ */
+object WaveformApp {
+
+    /** A running example: [step] renders (and polls audio), [close] releases it. */
+    class WaveformSession internal constructor(
+        private val pipeline: NsPipeline,
+        private val ui: ImGuiSdlApp.Session,
+        private val pumpAudio: Boolean,
+    ) : AutoCloseable {
+
+        private var closed = false
+
+        /** Advances one frame; `false` once the window was closed. */
+        fun step(): Boolean {
+            if (closed) return false
+            // A threaded pipeline runs on its own thread; the browser has none
+            // and is driven from here instead.
+            if (pumpAudio) pipeline.pump()
+            return ui.step()
+        }
+
+        /** Releases the window and the audio pipeline. Idempotent. */
+        override fun close() {
+            if (closed) return
+            closed = true
+            try {
+                ui.close()
+            } finally {
+                println(
+                    "processed ${pipeline.processedFrames} frames of ${pipeline.frameSize} samples at " +
+                        "${pipeline.level} suppression: input ${fixed(pipeline.inputDb, 1)} dBFS, " +
+                        "output ${fixed(pipeline.outputDb, 1)} dBFS" +
+                        if (pipeline.droppedPlaybackFrames > 0L) {
+                            ", ${pipeline.droppedPlaybackFrames} playback frames dropped"
+                        } else {
+                            ""
+                        },
+                )
+                pipeline.close()
+            }
+        }
+    }
+
+    /**
+     * Opens the window and the pipeline.
+     *
+     * [startPaused] keeps the audio devices closed until the UI is unpaused;
+     * browsers need that, because an `AudioContext` may only start after a user
+     * gesture. [threaded] starts the pipeline's blocking audio thread; the
+     * browser passes `false` and lets [WaveformSession.step] poll instead.
+     */
+    fun start(startPaused: Boolean = false, threaded: Boolean = true): WaveformSession? {
+        val pipeline = NsPipeline(windowSamples(MAX_WINDOW_MILLIS))
+        pipeline.paused = startPaused
+        val window = WaveformWindow(pipeline)
+        val ui = try {
+            ImGuiSdlApp.start("webrtc-ns-kmp waveform") { window.draw() }
+        } catch (t: Throwable) {
+            pipeline.close()
+            throw t
+        } ?: run {
+            pipeline.close()
+            return null
+        }
+        if (threaded) pipeline.start()
+        return WaveformSession(pipeline, ui, pumpAudio = !threaded)
+    }
+
+    /**
+     * Runs until [frames] frames were rendered or the window closes; returns
+     * `false` when no window could be opened.
+     */
+    fun run(frames: Int = Int.MAX_VALUE): Boolean {
+        val session = start(startPaused = false, threaded = true) ?: return false
+        var frame = 0
+        try {
+            while (frame < frames && session.step()) {
+                frame++
+            }
+        } finally {
+            session.close()
+        }
+        println("done")
+        return true
+    }
+}
+
+/**
+ * Blocking entry point of the JVM and native executables. The browser uses
+ * [WaveformApp.start] with `threaded = false` instead.
  *
  * [frames] bounds the run, which is what the automated (headless) runs use.
  * Returns `false` when no window could be opened.
  */
 fun runWaveformExample(frames: Int = Int.MAX_VALUE): Boolean {
     println("webrtc-ns-kmp waveform example (frames=$frames)")
-    val displayed = NsPipeline(windowSamples(MAX_WINDOW_MILLIS)).use { pipeline ->
-        val window = WaveformWindow(pipeline)
-        // Capture, suppression and playback run on the pipeline's own thread;
-        // this loop only draws (and reacts to) what it publishes.
-        pipeline.start()
-        val rendered = ImGuiSdlApp.run("webrtc-ns-kmp waveform", frames) {
-            window.draw()
-        }
-        // What a headless run has to show for itself: how much audio was
-        // processed and what the suppressor did to its level.
-        println(
-            "processed ${pipeline.processedFrames} frames of ${pipeline.frameSize} samples at " +
-                "${pipeline.level} suppression: input ${fixed(pipeline.inputDb, 1)} dBFS, " +
-                "output ${fixed(pipeline.outputDb, 1)} dBFS" +
-                if (pipeline.droppedPlaybackFrames > 0L) {
-                    ", ${pipeline.droppedPlaybackFrames} playback frames dropped"
-                } else {
-                    ""
-                },
-        )
-        rendered
-    }
-    println(if (displayed) "done" else "aborted")
+    val displayed = WaveformApp.run(frames)
+    if (!displayed) println("aborted")
     return displayed
 }

@@ -86,6 +86,18 @@ kotlin {
         }
     }
 
+    // The browser runs the same UI: SDL3 and Dear ImGui come from their
+    // Emscripten modules, the page loop drives one frame at a time, and the
+    // Web Audio backend of audio-io-kmp is polled from that loop.
+    wasmJs {
+        binaries.executable()
+        browser {
+            commonWebpackConfig {
+                outputFileName = "waveform.js"
+            }
+        }
+    }
+
     // Native targets that every dependency publishes klibs for (ns,
     // imgui-kmp, sdl-kmp and audio-io-kmp all ship macOS, Linux x86_64 and
     // Windows klibs, so the same UI source builds into a standalone executable
@@ -160,7 +172,65 @@ kotlin {
                 implementation(libs.audio.io.kmp)
             }
         }
+
+        getByName("wasmJsMain") {
+            dependencies {
+                implementation(libs.kotlinx.browser)
+                // The Emscripten runtimes (SDL3, Dear ImGui, Web Audio glue and
+                // the NS module) are installed as npm packages and copied next
+                // to the page by copyWasmAssets.
+                implementation(npm("@enaium/sdl-kmp", libs.versions.sdl.kmp.npm.get()))
+                implementation(npm("@enaium/imgui-kmp", libs.versions.imgui.kmp.npm.get()))
+                implementation(npm("@enaium/audio-io-kmp", libs.versions.audio.io.kmp.npm.get()))
+            }
+        }
     }
+}
+
+// ==================== Browser assets ====================
+// The Kotlin/Wasm module carries the bindings; SDL3, Dear ImGui and the NS
+// suppressor are Emscripten modules that the page loads first. The NS module is
+// staged from this checkout (`:ns:assembleWasmNpm`) because its npm package is
+// not published; the others come from the npm packages the JS toolchain
+// installed.
+val copyWasmAssets by tasks.registering {
+    description = "Copies the SDL, imgui, audio and NS Emscripten runtimes next to the page."
+    dependsOn(":kotlinWasmNpmInstall", ":ns:assembleWasmNpm")
+    val output = layout.buildDirectory.dir("generated/wasmResources")
+    outputs.dir(output)
+    doLast {
+        val dir = output.get().asFile
+        // Rebuild from scratch so a missing package cannot leave stale assets.
+        dir.deleteRecursively()
+        dir.mkdirs()
+        copy {
+            from(rootProject.layout.projectDirectory.dir("ns/build/npm")) {
+                include("webrtc_ns_kmp_glue.js", "webrtc_ns_wasm.js", "webrtc_ns_wasm.wasm")
+            }
+            into(dir)
+        }
+        // The JS plugin's npm workspace layout moves the packages around, so
+        // resolve the runtime files by name instead of a fixed path.
+        val packages = rootProject.fileTree(rootProject.layout.buildDirectory.dir("wasm")) {
+            include("**/node_modules/@enaium/sdl-kmp/sdl_kmp_glue.js")
+            include("**/node_modules/@enaium/sdl-kmp/sdl_wasm.js")
+            include("**/node_modules/@enaium/sdl-kmp/sdl_wasm.wasm")
+            include("**/node_modules/@enaium/imgui-kmp/imgui_kmp_glue.js")
+            include("**/node_modules/@enaium/imgui-kmp/imgui_kmp_exports.js")
+            include("**/node_modules/@enaium/imgui-kmp/imgui_wasm.js")
+            include("**/node_modules/@enaium/imgui-kmp/imgui_wasm.wasm")
+            include("**/node_modules/@enaium/audio-io-kmp/audio-io-kmp-web.js")
+        }
+        copy {
+            from(packages.files.groupBy { it.name }.map { it.value.first() })
+            into(dir)
+        }
+    }
+}
+
+tasks.named<ProcessResources>("wasmJsProcessResources") {
+    dependsOn(copyWasmAssets)
+    from(copyWasmAssets)
 }
 
 // Fill the stub directories the Android links above point at. Depending on the

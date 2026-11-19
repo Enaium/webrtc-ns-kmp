@@ -71,6 +71,8 @@ class WaveformWindow(
 
     private val nsEnabled = BooleanArray(1) { pipeline.nsEnabled }
 
+    private val audioActive = BooleanArray(1) { !pipeline.paused }
+
     private val playbackEnabled = BooleanArray(1) { pipeline.playbackEnabled }
 
     private val levelIndex = IntArray(1) { pipeline.level.ordinal }
@@ -130,6 +132,11 @@ class WaveformWindow(
             // the window is, the row wraps instead of clipping.
             newRow()
 
+            placeCheck("audio", audioActive) { pipeline.paused = !audioActive[0] }
+            ImGui.setItemTooltip(
+                "Start or pause audio. Browsers require this click before the AudioContext may start.",
+            )
+
             placeCheck("NS", nsEnabled) { pipeline.nsEnabled = nsEnabled[0] }
             ImGui.setItemTooltip(
                 "Noise suppressor. Switched off, the raw microphone is played back instead - " +
@@ -174,6 +181,10 @@ class WaveformWindow(
 
     /** Devices, format and levels: everything the window used to show above the controls. */
     private fun status(capturePeak: Float, outputPeak: Float) {
+        if (pipeline.paused) {
+            ImGui.text("audio: paused - click audio to open the microphone")
+        }
+
         val captureError = pipeline.captureError
         if (captureError == null) {
             ImGui.text("capture: ${pipeline.captureDeviceName} via ${pipeline.systemName}")

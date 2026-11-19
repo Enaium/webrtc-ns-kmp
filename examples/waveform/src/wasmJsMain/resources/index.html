@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>webrtc-ns-kmp waveform (wasm)</title>
+    <style>
+        html, body { margin: 0; height: 100%; background: #12121a; overflow: hidden; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+    </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<!-- Web Audio glue of audio-io-kmp: installs the audioIo_* functions. -->
+<script src="audio-io-kmp-web.js"></script>
+<script type="module">
+    import { initSdlKmp } from './sdl_kmp_glue.js';
+    import { initImguiKmp } from './imgui_kmp_glue.js';
+    import { initWebrtcNsKmp } from './webrtc_ns_kmp_glue.js';
+
+    const canvas = document.getElementById('canvas');
+
+    // ImGui/SDL consume the right button themselves; without this the browser's
+    // context menu opens on top of the canvas and swallows the button-up.
+    canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+    canvas.addEventListener('auxclick', (event) => {
+        if (event.button === 1) event.preventDefault();
+    });
+
+    // SDL owns the canvas and the renderer, imgui produces the draw data
+    // copied into SDL's geometry API, and the NS module is driven by the
+    // wasmJs actuals. All three have to be ready before Kotlin starts.
+    await initSdlKmp({ canvas });
+    await initImguiKmp();
+    await initWebrtcNsKmp();
+
+    await import('./waveform.js');
+</script>
+</body>
+</html>

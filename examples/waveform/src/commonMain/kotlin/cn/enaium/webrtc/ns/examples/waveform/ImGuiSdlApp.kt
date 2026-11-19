@@ -24,6 +24,7 @@ package cn.enaium.webrtc.ns.examples.waveform
 
 import cn.enaium.imgui.ImFontConfig
 import cn.enaium.imgui.ImGui
+import cn.enaium.imgui.ImGuiContext
 import cn.enaium.imgui.ImGuiStyleVar
 import cn.enaium.imgui.ImTextureID
 import cn.enaium.imgui.ImVec2
@@ -31,6 +32,7 @@ import cn.enaium.imgui.backends.sdl.ImGuiSdlBackend
 import cn.enaium.imgui.backends.sdl.ImGuiSdlGpuBackend
 import cn.enaium.imgui.backends.sdl.ImGuiSdlRendererBackend
 import cn.enaium.imgui.extensions.implot.ImPlot
+import cn.enaium.imgui.extensions.implot.ImPlotContext
 import cn.enaium.sdl.SDL
 import cn.enaium.sdl.SDLColor
 import cn.enaium.sdl.SDLEvent
@@ -43,7 +45,11 @@ import cn.enaium.sdl.SDLWindowFlags
 
 /**
  * Boots an SDL3 window with the GPU API, the published imgui-kmp SDL backends
- * and an ImPlot context, then runs the frame loop calling [draw].
+ * and an ImPlot context.
+ *
+ * [start] returns a [Session] the host drives one frame at a time; the browser
+ * needs that because its page loop must stay in charge, while [run] is the
+ * blocking loop of the desktop and native entry points.
  */
 object ImGuiSdlApp {
 
@@ -53,72 +59,150 @@ object ImGuiSdlApp {
     /** Style variables [pushScaledStyle] pushes per frame, and therefore pops. */
     private const val SCALED_STYLE_VARS = 6
 
+    /** Milliseconds between two frame rate reports. */
+    private const val FRAME_REPORT_MILLIS = 2000u
+
+    /**
+     * A running window: [step] renders one frame, [close] releases everything.
+     * Both have to be called from the thread that opened it.
+     */
+    interface Session : AutoCloseable {
+
+        /** Renders one frame; `false` once the window was closed. */
+        fun step(): Boolean
+
+        /** Releases ImGui, the renderer, the window and SDL. Idempotent. */
+        override fun close()
+    }
+
     /**
      * Runs until the window is closed or [frames] frames were drawn; returns
      * `false` when no window could be opened at all.
-     *
-     * `--frames` is passed through from the entry points to bound the run.
      */
     fun run(title: String, frames: Int = Int.MAX_VALUE, draw: (frame: Int) -> Unit): Boolean {
+        val session = start(title, draw) ?: return false
+        var frame = 0
+        try {
+            while (frame < frames && session.step()) {
+                frame++
+            }
+        } finally {
+            session.close()
+        }
+        return true
+    }
+
+    /**
+     * Opens SDL, the window, ImGui and ImPlot and returns the session that
+     * draws [draw], or `null` when SDL cannot open a window.
+     */
+    fun start(title: String, draw: (frame: Int) -> Unit): Session? {
         SDL.setMainReady()
         if (!SDL.init(SDLInitFlags.VIDEO or SDLInitFlags.EVENTS)) {
             // No silent fallback to SDL's dummy driver: rendering into an
             // invisible window looks exactly like a broken app. Headless runs
             // set SDL_VIDEO_DRIVER=dummy, which SDL picks up by itself.
             println("SDL_Init failed: ${SDL.error()}$videoInitHint")
-            return false
+            return null
         }
         val version = SDL.version()
         report("SDL ${version.major}.${version.minor}.${version.micro} (${SDL.revision()})")
         report("video driver: ${SDL.getCurrentVideoDriver()}")
 
-        SDL.createWindow(
+        val window = SDL.createWindow(
             title = title,
             width = 1280,
             height = 800,
             flags = SDLWindowFlags.RESIZABLE or SDLWindowFlags.HIGH_PIXEL_DENSITY,
-        ).use { window ->
-            // Android: a fullscreen SDL window is what makes SDLActivity hide
-            // the status and navigation bars that would draw over the UI.
-            if (windowStartsFullscreen) window.fullscreen = true
+        )
+        // Android: a fullscreen SDL window is what makes SDLActivity hide the
+        // status and navigation bars that would draw over the UI.
+        if (windowStartsFullscreen) window.fullscreen = true
 
-            // SDL_GPU is what the example renders with: it goes through Vulkan,
-            // Metal or D3D12 rather than the 2D renderer's GLES path. Where it
-            // is not available - a headless CI run on SDL's dummy driver, or a
-            // machine with no usable GPU driver - the reason is logged and the
-            // 2D renderer takes over, so the example still runs there.
-            val device = if (SDLGPU.isSupported) SDLGPU.createDevice() else null
-            val gpuDevice = when {
-                device == null -> {
-                    report("SDL_GPU is not supported on this platform; using the SDL renderer backend")
-                    null
-                }
-
-                device.claimWindow(window) -> {
-                    report("renderer: SDL_GPU [${SDLGPU.drivers.joinToString()}]")
-                    device
-                }
-
-                else -> {
-                    report("SDL_GPU cannot drive this window (${SDL.error()}); using the SDL renderer backend")
-                    device.close()
-                    null
-                }
+        // SDL_GPU is what the example renders with: it goes through Vulkan,
+        // Metal or D3D12 rather than the 2D renderer's GLES path. Where it is
+        // not available - a headless CI run on SDL's dummy driver, a browser
+        // without WebGPU, or a machine with no usable GPU driver - the reason is
+        // logged and the 2D renderer takes over, so the example still runs.
+        val device = if (SDLGPU.isSupported) SDLGPU.createDevice() else null
+        val gpuDevice = when {
+            device == null -> {
+                report("SDL_GPU is not supported on this platform; using the SDL renderer backend")
+                null
             }
 
-            try {
-                if (gpuDevice != null) {
-                    runLoop(window, frames, draw) { platform -> GpuFrameBackend(gpuDevice, window, platform) }
-                } else {
-                    runLoop(window, frames, draw) { RendererFrameBackend(window) }
-                }
-            } finally {
-                gpuDevice?.releaseDrawable(window)
-                gpuDevice?.close()
+            device.claimWindow(window) -> {
+                report("renderer: SDL_GPU [${SDLGPU.drivers.joinToString()}]")
+                device
+            }
+
+            else -> {
+                report("SDL_GPU cannot drive this window (${SDL.error()}); using the SDL renderer backend")
+                device.close()
+                null
             }
         }
-        SDL.quit()
-        return true
+
+        try {
+            val context = ImGui.createContext()
+            try {
+                val platform = ImGuiSdlBackend(window)
+                platform.init()
+                report(
+                    "ui scale: $uiScale, window ${window.sizeInPixels.x.toInt()}x" +
+                        "${window.sizeInPixels.y.toInt()} px",
+                )
+                val frameBackend = if (gpuDevice != null) {
+                    GpuFrameBackend(gpuDevice, window, platform)
+                } else {
+                    RendererFrameBackend(window)
+                }
+                try {
+                    // Bake the font at the host's UI scale - the display
+                    // density on Android, none on desktop - and at the
+                    // display's pixel density on top of that, so a 2712 px
+                    // phone gets touch sized text and a Retina screen crisp
+                    // glyphs.
+                    val fonts = ImGui.getIO().fonts
+                    val density = maxOf(platform.framebufferScale.x, platform.framebufferScale.y, 1f)
+                    fonts.addFontDefault(
+                        ImFontConfig(
+                            sizePixels = BASE_FONT_SIZE * uiScale * density,
+                            rasterizerDensity = density,
+                        ),
+                    )
+                    check(fonts.build()) { "font atlas build failed" }
+                    val texData = fonts.getTexDataAsRGBA32()
+                    fonts.setTexID(frameBackend.uploadFontTexture(texData.pixels, texData.width, texData.height))
+
+                    // ImPlot keeps its own context, bound to the imgui one.
+                    val plotContext = ImPlot.createContext()
+                    ImPlot.setImGuiContext(ImGui.getCurrentContext() ?: error("no imgui context"))
+
+                    return SessionImpl(
+                        window = window,
+                        gpuDevice = gpuDevice,
+                        context = context,
+                        plotContext = plotContext,
+                        platform = platform,
+                        frameBackend = frameBackend,
+                        draw = draw,
+                    )
+                } catch (t: Throwable) {
+                    frameBackend.close()
+                    throw t
+                }
+            } catch (t: Throwable) {
+                ImGui.destroyContext(context)
+                throw t
+            }
+        } catch (t: Throwable) {
+            gpuDevice?.releaseDrawable(window)
+            gpuDevice?.close()
+            window.close()
+            SDL.quit()
+            throw t
+        }
     }
 
     /** Scales the style sizes [SCALED_STYLE_VARS] of a touch UI to [scale]. */
@@ -131,112 +215,91 @@ object ImGuiSdlApp {
         ImGui.pushStyleVarFloat(ImGuiStyleVar.GRAB_MIN_SIZE, 10f * scale)
     }
 
-    /** Runs the frame loop with the backend [createBackend] builds. */
-    private fun runLoop(
-        window: SDLWindow,
-        frames: Int,
-        draw: (frame: Int) -> Unit,
-        createBackend: (ImGuiSdlBackend) -> FrameBackend,
-    ) {
-        val context = ImGui.createContext()
-        try {
-            val platform = ImGuiSdlBackend(window)
-            platform.init()
-            report(
-                "ui scale: $uiScale, window ${window.sizeInPixels.x.toInt()}x" +
-                    "${window.sizeInPixels.y.toInt()} px",
-            )
-            val frameBackend = createBackend(platform)
-            try {
-                // Bake the font at the host's UI scale - the display density on
-                // Android, none on desktop - and at the display's pixel density
-                // on top of that, so a 2712 px phone gets touch sized text and a
-                // Retina screen crisp glyphs.
-                val fonts = ImGui.getIO().fonts
-                val density = maxOf(platform.framebufferScale.x, platform.framebufferScale.y, 1f)
-                fonts.addFontDefault(
-                    ImFontConfig(
-                        sizePixels = BASE_FONT_SIZE * uiScale * density,
-                        rasterizerDensity = density,
-                    ),
-                )
-                check(fonts.build()) { "font atlas build failed" }
-                val texData = fonts.getTexDataAsRGBA32()
-                fonts.setTexID(frameBackend.uploadFontTexture(texData.pixels, texData.width, texData.height))
+    private class SessionImpl(
+        private val window: SDLWindow,
+        private val gpuDevice: SDLGPUDevice?,
+        private val context: ImGuiContext,
+        private val plotContext: ImPlotContext,
+        private val platform: ImGuiSdlBackend,
+        private val frameBackend: FrameBackend,
+        private val draw: (frame: Int) -> Unit,
+    ) : Session {
 
-                // ImPlot keeps its own context, bound to the imgui one.
-                val plotContext = ImPlot.createContext()
-                ImPlot.setImGuiContext(ImGui.getCurrentContext() ?: error("no imgui context"))
+        private var running = true
+        private var frame = 0
+        private var closed = false
+        private var lastReport = SDL.getTicks()
+        private var framesAtReport = 0
+        private var drawMillis = 0.0
+        private var renderMillis = 0.0
+        private var buildMillis = 0.0
 
-                var running = true
-                var frame = 0
-                var lastReport = SDL.getTicks()
-                var framesAtReport = 0
-                var drawMillis = 0.0
-                var renderMillis = 0.0
-                var buildMillis = 0.0
-                while (running && frame < frames) {
-                    while (true) {
-                        val event = SDL.pollEvent() ?: break
-                        when (event) {
-                            is SDLEvent.Quit -> running = false
-                            is SDLEvent.Window ->
-                                if (event.type == SDLWindowEventType.CLOSE_REQUESTED) running = false
+        override fun step(): Boolean {
+            if (closed || !running) return false
 
-                            else -> platform.processEvent(event)
-                        }
-                    }
+            while (true) {
+                val event = SDL.pollEvent() ?: break
+                when (event) {
+                    is SDLEvent.Quit -> running = false
+                    is SDLEvent.Window ->
+                        if (event.type == SDLWindowEventType.CLOSE_REQUESTED) running = false
 
-                    val t0 = SDL.getTicks()
-                    platform.newFrame()
-                    // The style sizes (padding, spacing, scrollbars) are in the
-                    // same units as the font, so they grow with it; the binding
-                    // has no Style.ScaleAllSizes, so the ones a touch UI cares
-                    // about are pushed for this frame.
-                    if (uiScale != 1f) pushScaledStyle(uiScale)
-                    draw(frame)
-                    if (uiScale != 1f) ImGui.popStyleVar(SCALED_STYLE_VARS)
-                    val t1 = SDL.getTicks()
-                    ImGui.render()
-                    val t2 = SDL.getTicks()
-                    frameBackend.render()
-                    val t3 = SDL.getTicks()
-                    frame++
-                    drawMillis += (t1 - t0).toDouble()
-                    buildMillis += (t2 - t1).toDouble()
-                    renderMillis += (t3 - t2).toDouble()
-
-                    // The frame rate is what tells whether the render loop is
-                    // still doing anything but drawing.
-                    val now = SDL.getTicks()
-                    if (now - lastReport >= FRAME_REPORT_MILLIS) {
-                        val elapsed = (now - lastReport).toDouble() / 1000.0
-                        val count = (frame - framesAtReport).toDouble()
-                        report(
-                            "render: ${fixed(count / elapsed, 1)} fps, draw ${fixed(drawMillis / count, 1)} ms, " +
-                                "imgui ${fixed(buildMillis / count, 1)} ms, present ${fixed(renderMillis / count, 1)} ms",
-                        )
-                        framesAtReport = frame
-                        drawMillis = 0.0
-                        renderMillis = 0.0
-                        buildMillis = 0.0
-                        lastReport = now
-                    }
+                    else -> platform.processEvent(event)
                 }
-
-                ImPlot.destroyContext(plotContext)
-            } finally {
-                frameBackend.close()
             }
-        } finally {
+            if (!running) return false
+
+            val t0 = SDL.getTicks()
+            platform.newFrame()
+            // The style sizes (padding, spacing, scrollbars) are in the same
+            // units as the font, so they grow with it; the binding has no
+            // Style.ScaleAllSizes, so the ones a touch UI cares about are
+            // pushed for this frame.
+            if (uiScale != 1f) pushScaledStyle(uiScale)
+            draw(frame)
+            if (uiScale != 1f) ImGui.popStyleVar(SCALED_STYLE_VARS)
+            val t1 = SDL.getTicks()
+            ImGui.render()
+            val t2 = SDL.getTicks()
+            frameBackend.render()
+            val t3 = SDL.getTicks()
+            frame++
+            drawMillis += (t1 - t0).toDouble()
+            buildMillis += (t2 - t1).toDouble()
+            renderMillis += (t3 - t2).toDouble()
+
+            // The frame rate is what tells whether the render loop is still
+            // doing anything but drawing.
+            val now = SDL.getTicks()
+            if (now - lastReport >= FRAME_REPORT_MILLIS) {
+                val elapsed = (now - lastReport).toDouble() / 1000.0
+                val count = (frame - framesAtReport).toDouble()
+                report(
+                    "render: ${fixed(count / elapsed, 1)} fps, draw ${fixed(drawMillis / count, 1)} ms, " +
+                        "imgui ${fixed(buildMillis / count, 1)} ms, present ${fixed(renderMillis / count, 1)} ms",
+                )
+                framesAtReport = frame
+                drawMillis = 0.0
+                renderMillis = 0.0
+                buildMillis = 0.0
+                lastReport = now
+            }
+            return true
+        }
+
+        override fun close() {
+            if (closed) return
+            closed = true
+            running = false
+            ImPlot.destroyContext(plotContext)
+            frameBackend.close()
             ImGui.destroyContext(context)
+            gpuDevice?.releaseDrawable(window)
+            gpuDevice?.close()
+            window.close()
+            SDL.quit()
         }
     }
-
-    /** Presents ImGui frames with one of SDL's rendering paths. */
-
-/** Milliseconds between two frame rate reports. */
-private const val FRAME_REPORT_MILLIS = 2000u
 
     private interface FrameBackend {
 
