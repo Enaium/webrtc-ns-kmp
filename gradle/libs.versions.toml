@@ -18,8 +18,8 @@ sdl-kmp = "1.0.14-fixed.3.4.18"
 audio-io-kmp = "1.1.0"
 # Emscripten runtimes the browser examples load; they are the npm packages of
 # the same builds as the Maven artifacts above.
-imgui-kmp-npm = "1.93.0-2"
-sdl-kmp-npm = "3.4.18-2"
+imgui-kmp-npm = "1.0.17-fixed.1.93.0"
+sdl-kmp-npm = "1.0.14-fixed.3.4.18"
 audio-io-kmp-npm = "1.1.0"
 kotlinx-browser = "0.5.0"
 
