@@ -15,6 +15,7 @@ Kotlin Multiplatform bindings for the [WebRTC noise suppressor](https://github.c
 | **Windows**    | mingwX64                                                     | Kotlin/Native cinterop (bindings)          |
 | **tvOS**       | arm64, simulatorArm64                                        | Kotlin/Native cinterop (static library)    |
 | **watchOS**    | arm64, simulatorArm64, deviceArm64                           | Kotlin/Native cinterop (static library)    |
+| **WebAssembly** | wasmJs (browser and Node)                                  | Emscripten module + JS glue (npm package)  |
 
 ## Gradle Dependency
 
@@ -35,6 +36,21 @@ implementation("cn.enaium.webrtc.ns:webrtc-ns-kmp:1.0.0-rolling.pRJneQThJ")
 - `webrtc-ns-kmp-jni-jvm-windows-x86_64`
 
 `NativeLoader` detects `os.name`/`os.arch` at runtime, extracts the matching binary from the classpath to a temp directory, and `System.load`s it. No `java.library.path` setup is required for downstream JVM consumers.
+
+**Kotlin/Wasm:** Kotlin/Wasm has no cinterop, so the klib is accompanied by an npm package that carries the Emscripten-compiled suppressor and its JS glue:
+
+```bash
+npm install @enaium/webrtc-ns-kmp
+```
+
+```javascript
+// Before the Kotlin/Wasm module runs: the glue instantiates the Emscripten
+// module and installs the globals the wasmJs actuals call.
+import { initWebrtcNsKmp } from "@enaium/webrtc-ns-kmp";
+await initWebrtcNsKmp();
+```
+
+After that `createNoiseSuppressor(...)` works from Kotlin/Wasm exactly as on the other targets. The package version is the same as the Maven artifact version.
 
 ## Quick Start
 
@@ -145,6 +161,7 @@ Native executables (`./examples/waveform/build/bin/<target>/<mode>Executable/wav
 - Android SDK + NDK (for Android targets)
 - Xcode command-line tools (for iOS/macOS/tvOS/watchOS targets)
 - MinGW-w64 (for Windows targets from Linux/Windows)
+- Emscripten SDK (for the wasmJs target and the npm package); `EMSDK` or `-Pwasm.emsdk=<path>` points at it
 
 ### Clone with submodules
 
@@ -164,6 +181,9 @@ cd webrtc-ns-kmp
 ```bash
 ./gradlew :ns:jvmTest        # JVM (JNI), compares against the WAV fixtures
 ./gradlew :ns:macosArm64Test # macOS native (cinterop + static library)
+./gradlew :ns:compileKotlinWasmJs
+./gradlew :ns:assembleWasmNpm -Pwasm.emsdk="$HOME/emsdk"   # stage build/npm
+node ns/wasm/webrtc_ns_wasm_test.mjs                       # Emscripten -> glue -> NS
 ```
 
 ## Project Structure
@@ -181,12 +201,14 @@ webrtc-ns-kmp/
 │       └── windows-x86_64
 ├── ns/                       # Kotlin Multiplatform module
 │   ├── build.gradle.kts
+│   ├── wasm/                 # Emscripten CMake, C shim, JS glue, Node test
 │   └── src/
 │       ├── commonMain/       # expect declarations + common interfaces
 │       ├── commonTest/
 │       ├── jvmMain/          # JVM actual (JNI) + NativeLoader
 │       ├── androidMain/      # Android actual (JNI)
 │       ├── nativeMain/       # Native actual (cinterop)
+│       ├── wasmJsMain/       # wasmJs actual driving the JS glue
 │       └── nativeInterop/cinterop/
 ├── examples/
 │   ├── basic/                # Android Compose demo (loopback + NS switch)

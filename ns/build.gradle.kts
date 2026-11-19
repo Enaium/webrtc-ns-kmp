@@ -111,6 +111,12 @@ kotlin {
         }
     }
 
+    // ==================== WebAssembly ====================
+    // Kotlin/Wasm has no cinterop, so the wasmJs actuals drive a standalone
+    // Emscripten module through a JS glue layer; see the wasm section below
+    // and ns/wasm/.
+    wasmJs()
+
     // ==================== Native ====================
     macosArm64()
     macosX64()
@@ -206,6 +212,17 @@ kotlin {
             // NativeLoader falls back to System.loadLibrary since the .so is
             // bundled inside the AAR's jniLibs.
             kotlin.srcDir("src/jvmMain/kotlin")
+        }
+
+        getByName("wasmJsMain") {
+            // The repository disables the automatic default hierarchy
+            // template, so the leaf source sets are wired up explicitly.
+            dependsOn(getByName("commonMain"))
+            dependencies {
+                // org.khronos.webgl typed arrays used to marshal frames across
+                // the JS bridge into the Emscripten module.
+                implementation(libs.kotlinx.browser)
+            }
         }
     }
 }
@@ -489,6 +506,226 @@ androidComponents {
 
 tasks.matching { it.name.startsWith("merge") && it.name.contains("JniLibFolders") }
     .configureEach { dependsOn(buildAndroidJniLibs) }
+
+// ==================== wasm: build the NS module for the wasmJs target ====================
+// Kotlin/Wasm has no cinterop and cannot embed C libraries, so NS is compiled
+// to a standalone Emscripten module (webrtc_ns_wasm.js + .wasm) that the
+// wasmJs actuals drive through a JS glue layer (see ns/wasm/).
+
+fun emsdkPath(): String {
+    System.getenv("EMSDK")?.takeIf { it.isNotBlank() }?.let { return it }
+    providers.gradleProperty("wasm.emsdk").orNull?.takeIf { it.isNotBlank() }?.let { return it }
+    val home = System.getProperty("user.home")
+    listOf(File(home, "emsdk"), File(home, "sdk/emsdk"))
+        .forEach { if (it.isDirectory()) return it.absolutePath }
+    return ""
+}
+
+val wasmEmsdk = emsdkPath()
+val wasmEmcc = File(wasmEmsdk, "upstream/emscripten/emcc")
+val wasmEmxx = File(wasmEmsdk, "upstream/emscripten/em++")
+val wasmToolchain = File(wasmEmsdk, "upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake")
+val wasmSrcDir = projectDir.resolve("wasm")
+val wasmOutputDir = layout.buildDirectory.dir("wasmNs").get().asFile
+val wasmNativeDir = File(wasmOutputDir, "native")
+val wasmShimObject = File(wasmOutputDir, "webrtc_ns_wasm_shim.o")
+val wasmModuleJs = File(wasmOutputDir, "webrtc_ns_wasm.js")
+val wasmModuleWasm = File(wasmOutputDir, "webrtc_ns_wasm.wasm")
+
+// Emscripten requires Python >= 3.10; the emsdk ships its own interpreter,
+// which may not be on PATH (e.g. macOS ships Python 3.9 as /usr/bin/python3).
+fun wasmEnv(): Map<String, String> {
+    val pythonDir = File(wasmEmsdk, "python").listFiles()?.firstOrNull { it.isDirectory }
+    return if (pythonDir != null) {
+        mapOf("PATH" to "${pythonDir.absolutePath}/bin:${System.getenv("PATH")}")
+    } else {
+        emptyMap()
+    }
+}
+
+val wasmExports = listOf(
+    "webrtc_ns_wasm_create",
+    "webrtc_ns_wasm_destroy",
+    "webrtc_ns_wasm_analyze",
+    "webrtc_ns_wasm_process",
+    "webrtc_ns_wasm_set_capture_output_usage",
+    "webrtc_ns_wasm_sample_rate_hz",
+    "webrtc_ns_wasm_num_channels",
+    "webrtc_ns_wasm_num_frames_per_channel",
+    "webrtc_ns_wasm_version",
+    "malloc",
+    "free",
+).joinToString(",") { "_$it" }
+
+val configureWasmNs by tasks.registering(Exec::class) {
+    group = "build"
+    description = "cmake-configures the WebRTC NS static library for wasmJs."
+    onlyIf { wasmEmcc.isFile }
+    doFirst {
+        File(wasmOutputDir, "cmake").mkdirs()
+        wasmNativeDir.mkdirs()
+    }
+    workingDir = File(wasmOutputDir, "cmake")
+    environment(wasmEnv())
+    // A toolchain file disables the generator's normal make discovery, so the
+    // make program must be passed explicitly (emcmake does the same).
+    val makeProgram = if (hostOs.isWindows) "nmake" else "/usr/bin/make"
+    commandLine(
+        cmakeExecutable, wasmSrcDir.absolutePath,
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_TOOLCHAIN_FILE=${wasmToolchain.absolutePath}",
+        "-DCMAKE_MAKE_PROGRAM=$makeProgram",
+        "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${wasmNativeDir.absolutePath}",
+    )
+}
+
+val buildWasmNs by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Builds libwebrtc_ns.a for wasmJs."
+    onlyIf { wasmEmcc.isFile }
+    dependsOn(configureWasmNs)
+    workingDir = File(wasmOutputDir, "cmake")
+    environment(wasmEnv())
+    commandLine(cmakeExecutable, "--build", ".", "--config", "Release")
+    outputs.file(File(wasmNativeDir, "libwebrtc_ns.a"))
+}
+
+val compileWasmShim by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Compiles the handle-based NS wasm shim."
+    onlyIf { wasmEmcc.isFile }
+    doFirst { wasmOutputDir.mkdirs() }
+    environment(wasmEnv())
+    commandLine(
+        wasmEmcc.absolutePath, "-O2", "-c",
+        File(wasmSrcDir, "webrtc_ns_wasm_shim.c").absolutePath,
+        "-I${rootProject.projectDir.resolve("jni/c_api").absolutePath}",
+        "-o", wasmShimObject.absolutePath,
+    )
+    inputs.file(File(wasmSrcDir, "webrtc_ns_wasm_shim.c"))
+    inputs.file(rootProject.file("jni/c_api/webrtc_ns_c.h"))
+    outputs.file(wasmShimObject)
+}
+
+val linkWasmNs by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Links the WebRTC NS Emscripten module (webrtc_ns_wasm.js/.wasm)."
+    onlyIf { wasmEmcc.isFile }
+    dependsOn(buildWasmNs, compileWasmShim)
+    environment(wasmEnv())
+    commandLine(
+        wasmEmxx.absolutePath,
+        wasmShimObject.absolutePath,
+        File(wasmNativeDir, "libwebrtc_ns.a").absolutePath,
+        "-o", wasmModuleJs.absolutePath,
+        "-O2",
+        "-sMODULARIZE=1", "-sEXPORT_NAME=WebrtcNsModule", "-sEXPORT_ES6=1",
+        "-sEXPORTED_FUNCTIONS=$wasmExports",
+        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,HEAPF32",
+        "-sALLOW_MEMORY_GROWTH=1", "-sINITIAL_MEMORY=16777216",
+        "-sENVIRONMENT=web,worker,node", "-sFILESYSTEM=0", "--no-entry",
+    )
+    inputs.files(wasmShimObject, File(wasmNativeDir, "libwebrtc_ns.a"))
+    inputs.file(File(wasmSrcDir, "CMakeLists.txt"))
+    outputs.files(wasmModuleJs, wasmModuleWasm)
+}
+
+// ==================== wasm: npm package ====================
+// The Emscripten module and the JS glue ship as an npm package
+// (@enaium/webrtc-ns-kmp): web apps depend on it like any other npm package
+// and `import { initWebrtcNsKmp } from "@enaium/webrtc-ns-kmp"` before
+// running the Kotlin/Wasm module, so no asset extraction step is involved.
+//
+// The package version is the project version, so Maven and npm share one
+// version.
+
+val npmPackageVersion: String by lazy { rootProject.version.toString() }
+
+val wasmNpmDir = layout.buildDirectory.dir("npm").get().asFile
+val wasmGlue = wasmSrcDir.resolve("webrtc_ns_kmp_glue.js")
+
+tasks.register("assembleWasmNpm") {
+    group = "build"
+    description = "Stages the @enaium/webrtc-ns-kmp npm package in build/npm."
+    dependsOn(linkWasmNs)
+    inputs.file(wasmGlue)
+    inputs.property("npmPackageVersion", npmPackageVersion)
+    inputs.files(wasmModuleJs, wasmModuleWasm)
+    outputs.dir(wasmNpmDir)
+    doFirst {
+        if (!wasmModuleJs.isFile || !wasmModuleWasm.isFile) {
+            throw GradleException(
+                "The wasmJS module was not built: set EMSDK or pass -Pwasm.emsdk=<path>, " +
+                    "then run :ns:linkWasmNs.",
+            )
+        }
+        wasmNpmDir.deleteRecursively()
+        wasmNpmDir.mkdirs()
+        wasmGlue.copyTo(wasmNpmDir.resolve("webrtc_ns_kmp_glue.js"), overwrite = true)
+        wasmModuleJs.copyTo(wasmNpmDir.resolve("webrtc_ns_wasm.js"), overwrite = true)
+        wasmModuleWasm.copyTo(wasmNpmDir.resolve("webrtc_ns_wasm.wasm"), overwrite = true)
+        rootProject.file("LICENSE").copyTo(wasmNpmDir.resolve("LICENSE"), overwrite = true)
+        // The wasm binary contains the BSD-3-Clause WebRTC NS sources.
+        rootProject.file("webrtc-ns/LICENSE")
+            .copyTo(wasmNpmDir.resolve("LICENSE-BSD-3"), overwrite = true)
+        wasmNpmDir.resolve("package.json").writeText(
+            """
+            {
+              "name": "@enaium/webrtc-ns-kmp",
+              "version": "$npmPackageVersion",
+              "description": "Emscripten-compiled WebRTC noise suppressor and JS glue for the webrtc-ns-kmp wasmJs target",
+              "license": "MIT",
+              "type": "module",
+              "exports": {
+                ".": "./webrtc_ns_kmp_glue.js",
+                "./webrtc_ns_wasm.js": "./webrtc_ns_wasm.js",
+                "./package.json": "./package.json"
+              },
+              "files": ["webrtc_ns_kmp_glue.js", "webrtc_ns_wasm.js", "webrtc_ns_wasm.wasm", "LICENSE", "LICENSE-BSD-3"],
+              "homepage": "https://github.com/Enaium/webrtc-ns-kmp",
+              "repository": {
+                "type": "git",
+                "url": "git+https://github.com/Enaium/webrtc-ns-kmp.git"
+              }
+            }
+            """.trimIndent() + "\n",
+        )
+    }
+}
+
+tasks.register<Exec>("publishWasmNpm") {
+    group = "publishing"
+    description = "Publishes @enaium/webrtc-ns-kmp to npm (token: npm.publish.key)."
+    dependsOn("assembleWasmNpm")
+    workingDir = wasmNpmDir
+    // The token lives in the user-level Gradle properties file
+    // (~/.gradle/gradle.properties, next to mavenCentralUsername and the
+    // signing.* entries); CI writes the same key there from a repository
+    // secret. `-Pnpm.publish.key=<token>` overrides it for one-off runs.
+    val npmKey = providers.gradleProperty("npm.publish.key")
+    doFirst {
+        val key = npmKey.orNull?.takeIf { it.isNotBlank() }
+            ?: throw GradleException(
+                "npm.publish.key is not set: add it to ~/.gradle/gradle.properties " +
+                    "or pass -Pnpm.publish.key=<token>",
+            )
+        environment("NODE_AUTH_TOKEN", key)
+        wasmNpmDir.resolve(".npmrc").writeText(
+            "//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}\n",
+        )
+    }
+    commandLine("npm", "publish", "--access", "public", "--tag", "latest")
+}
+
+// Headless check of the whole pipeline: Emscripten module -> JS glue ->
+// suppressor, driven by Node (see ns/wasm/webrtc_ns_wasm_test.mjs).
+tasks.register<Exec>("testWasmNs") {
+    group = "verification"
+    description = "Runs the Node smoke test against the staged wasmJs npm package."
+    dependsOn("assembleWasmNpm")
+    workingDir = projectDir
+    commandLine("node", wasmSrcDir.resolve("webrtc_ns_wasm_test.mjs").absolutePath)
+}
 
 // ==================== Publishing ====================
 // Version is read from VERSION_NAME in gradle.properties (or -Pversion).
